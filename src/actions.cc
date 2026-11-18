@@ -419,6 +419,32 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         tiramisu::prepare_schedules_for_legality_checks(true);
         break;
     }
+    case 'E':
+    {
+        // E(L<level>,comps=[<comp>]): expand the temporary buffer written by
+        // <comp> along its loop at <level> (function::expand_buffer_along_loop).
+        // E(comps=[<comp>]): Tiramisu's expand() of that one computation.
+        std::regex loop_re("E\\(L(\\d+),comps=\\[([\\w', ]*)\\]\\)");
+        std::regex comp_re("E\\(comps=\\[([\\w', ]*)\\]\\)");
+        std::smatch match;
+        bool along_loop = std::regex_search(action_str, match, loop_re);
+        if (!along_loop)
+            parse_or_throw(action_str, match, comp_re);
+        std::string comps_str = match[along_loop ? 2 : 1];
+        comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
+        auto comps = get_comps(comps_str, implicit_function);
+        if (comps.size() != 1)
+            throw std::invalid_argument("Expansion needs exactly one computation: " + action_str);
+        if (!along_loop)
+        {
+            comps[0]->expand(true);
+            break;
+        }
+        tiramisu::prepare_schedules_for_legality_checks(true);
+        int level = tree_level_to_tiramisu_level(comps[0], std::stoi(match[1]));
+        is_legal = implicit_function->expand_buffer_along_loop(comps[0], level);
+        break;
+    }
     case 'T':
     {
         if (action_str[1] == '1')
@@ -559,19 +585,31 @@ bool apply_actions_from_schedule_str(std::string schedule_str, tiramisu::functio
 
     std::string delimiter = "|";
     size_t pos = 0;
-    std::string token;
-    bool is_legal = true;
-
+    std::vector<std::string> tokens;
     while ((pos = schedule_str.find(delimiter)) != std::string::npos)
     {
-        token = schedule_str.substr(0, pos);
-        // std::cout << token << std::endl;
-        is_legal &= apply_action(token, implicit_function, result);
+        tokens.push_back(schedule_str.substr(0, pos));
         schedule_str.erase(0, pos + delimiter.length());
     }
+    tokens.push_back(schedule_str);
 
-    // std::cout << schedule_str << std::endl;
-    is_legal &= apply_action(schedule_str, implicit_function, result);
+    // Expansion changes where values are stored, not when they are computed,
+    // and is defined on the original loops, so it has to come first.
+    bool seen_other = false;
+    for (auto &token : tokens)
+    {
+        if (token.empty())
+            continue;
+        if (token[0] != 'E')
+            seen_other = true;
+        else if (seen_other)
+            throw std::invalid_argument(
+                "Expansion must come before every other transformation: " + token);
+    }
+
+    bool is_legal = true;
+    for (auto &token : tokens)
+        is_legal &= apply_action(token, implicit_function, result);
 
     return is_legal;
 }

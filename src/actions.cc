@@ -2,6 +2,8 @@
 #include <string>
 #include <regex>
 #include <unordered_set>
+#include <unordered_map>
+#include <tuple>
 #include <TiraLibCPP/utils.h>
 #include <TiraLibCPP/dbhelpers.h>
 
@@ -13,6 +15,72 @@ static void parse_or_throw(const std::string &action_str, std::smatch &match,
         throw std::invalid_argument(
             "Failed to parse schedule token: " + action_str);
     }
+}
+
+// Tiramisu schedules have the layout [dup, s0, L0, s1, L1, ..., sn]: loop
+// level l is output dimension 2l+2 and the static (ordering) dimension in
+// front of it is 2l+1.
+static int loop_dim(int level) { return 2 * level + 2; }
+
+static int number_of_loop_levels(tiramisu::computation *comp)
+{
+    return (isl_map_dim(comp->get_schedule(), isl_dim_out) - 2) / 2;
+}
+
+// True if loop level `level` takes a single value over the computation's
+// iteration domain (padding added by align_schedules, or a tile loop whose
+// tile covers the whole loop).
+static bool loop_level_is_singleton(tiramisu::computation *comp, int level)
+{
+    isl_map *sched = isl_map_intersect_domain(
+        isl_map_copy(comp->get_schedule()),
+        isl_set_copy(comp->get_iteration_domain()));
+    isl_set *range = isl_map_range(sched);
+    int n = isl_set_dim(range, isl_dim_set);
+    int d = loop_dim(level);
+    range = isl_set_project_out(range, isl_dim_set, d + 1, n - d - 1);
+    range = isl_set_project_out(range, isl_dim_set, 0, d);
+    bool singleton = isl_set_is_singleton(range) == isl_bool_true;
+    isl_set_free(range);
+    return singleton;
+}
+
+// TiraLib numbers loops from the ISL AST, which omits loops that run once, so
+// its level for a loop can be lower than Tiramisu's. Map a TiraLib level to
+// Tiramisu's by counting only the levels that actually vary.
+static int tree_level_to_tiramisu_level(tiramisu::computation *comp, int tree_level)
+{
+    int varying = -1;
+    int n = number_of_loop_levels(comp);
+    for (int level = 0; level < n; level++)
+    {
+        if (loop_level_is_singleton(comp, level))
+            continue;
+        if (++varying == tree_level)
+            return level;
+    }
+    throw std::invalid_argument(
+        "Loop level L" + std::to_string(tree_level) + " does not exist for " + comp->get_name());
+}
+
+// Deepest loop level shared by two computations, read from the static
+// dimensions of their (aligned, ordered) schedules; -1 if they share none.
+static int shared_loop_level(tiramisu::computation *a, tiramisu::computation *b)
+{
+    int n = std::min(number_of_loop_levels(a), number_of_loop_levels(b));
+    int level = -1;
+    for (int l = 0; l < n; l++)
+    {
+        isl_val *va = isl_map_plain_get_val_if_fixed(a->get_schedule(), isl_dim_out, loop_dim(l) - 1);
+        isl_val *vb = isl_map_plain_get_val_if_fixed(b->get_schedule(), isl_dim_out, loop_dim(l) - 1);
+        bool same = va && vb && !isl_val_is_nan(va) && !isl_val_is_nan(vb) && isl_val_eq(va, vb) == isl_bool_true;
+        isl_val_free(va);
+        isl_val_free(vb);
+        if (!same)
+            break;
+        level = l;
+    }
+    return level;
 }
 
 bool apply_action(std::string action_str, tiramisu::function *implicit_function, Result &result)
@@ -267,6 +335,88 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         }
 
         is_legal &= factors.size() > 0;
+        break;
+    }
+    case 'D':
+    {
+        // D(L<level>,comps=[<comp>],distribution=[[c0,c1],[c2],...]): split the
+        // loop at <level> enclosing <comp> so that each group of computations
+        // gets its own copy of the loop. Computations in the same group stay
+        // fused; the relative order of the computations is unchanged.
+        std::regex re("D\\(L(\\d+),comps=\\[([\\w', ]*)\\],distribution=\\[(.*)\\]\\)");
+        std::smatch match;
+        parse_or_throw(action_str, match, re);
+        int tree_level = std::stoi(match[1]);
+        std::string comps_str = match[2];
+        comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
+        auto anchor = get_comps(comps_str, implicit_function);
+        if (anchor.size() != 1)
+            throw std::invalid_argument("Distribution needs exactly one anchor computation: " + action_str);
+
+        std::unordered_map<tiramisu::computation *, int> group_of;
+        std::string groups_str = match[3];
+        std::regex group_re("\\[([\\w', ]*)\\]");
+        int nb_groups = 0;
+        for (std::sregex_iterator it(groups_str.begin(), groups_str.end(), group_re), end; it != end; ++it)
+        {
+            std::string group_str = (*it)[1];
+            group_str.erase(std::remove_if(group_str.begin(), group_str.end(), isSingleQuoteOrWhiteSpace), group_str.end());
+            if (group_str.empty())
+                continue;
+            for (auto comp : get_comps(group_str, implicit_function))
+            {
+                if (!group_of.emplace(comp, nb_groups).second)
+                    throw std::invalid_argument(
+                        "Computation " + comp->get_name() + " is in two distribution groups: " + action_str);
+            }
+            nb_groups++;
+        }
+        if (nb_groups < 2)
+            throw std::invalid_argument("Distribution needs at least two groups: " + action_str);
+
+        tiramisu::prepare_schedules_for_legality_checks(true);
+        int level = tree_level_to_tiramisu_level(anchor[0], tree_level);
+
+        // Walk the schedule chain and record the level at which each pair of
+        // consecutive computations is ordered. A pair from different groups
+        // that is still fused at `level` or deeper is cut just above it; the
+        // other pairs keep their level. Tiramisu's after() only ever raises a
+        // level, so the chain is cleared and rebuilt with the new levels.
+        tiramisu::computation *head = anchor[0];
+        while (head->get_predecessor() != nullptr)
+            head = head->get_predecessor();
+        std::vector<tiramisu::computation *> chain = {head};
+        while (chain.back()->get_successor() != nullptr)
+            chain.push_back(chain.back()->get_successor());
+        // Like fuse_comps_sched_graph, this assumes the program is ordered as
+        // a single chain (true for programs written with then()).
+        std::unordered_set<tiramisu::computation *> in_chain(chain.begin(), chain.end());
+        for (auto &entry : group_of)
+            if (!in_chain.count(entry.first))
+                throw std::invalid_argument("Distribution needs all computations in one schedule chain: " + action_str);
+
+        std::vector<int> levels;
+        bool cut = false;
+        for (size_t i = 0; i + 1 < chain.size(); i++)
+        {
+            int pair_level = shared_loop_level(chain[i], chain[i + 1]);
+            auto g_cur = group_of.find(chain[i]), g_succ = group_of.find(chain[i + 1]);
+            if (g_cur != group_of.end() && g_succ != group_of.end() &&
+                g_cur->second != g_succ->second && pair_level >= level)
+            {
+                pair_level = level - 1;
+                cut = true;
+            }
+            levels.push_back(pair_level);
+        }
+        if (!cut)
+            throw std::invalid_argument("Distribution does not split any loop: " + action_str);
+
+        tiramisu::clear_implicit_function_sched_graph();
+        for (size_t i = 0; i + 1 < chain.size(); i++)
+            chain[i]->then(*chain[i + 1], levels[i]);
+
+        tiramisu::prepare_schedules_for_legality_checks(true);
         break;
     }
     case 'T':
